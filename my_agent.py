@@ -1,343 +1,370 @@
-"""
-Hybrid DQN-style Flappy Bird agent.
-
-Main idea:
-- Implements the required choose_action(...) and receive_after_action_observation(...).
-- Keeps a DQN replay-memory + target-network training structure.
-- Uses a strong deterministic controller as a teacher/fallback so the agent does not get
-  stuck with score 0 while waiting for random exploration to discover the first pipe.
-"""
-
-# Ran 15000 episodes in level 5, 12000 in level 1, 10000 in level 2, 5000 in level 3, 10000 in level 4
-# Producing max score in level 5 but very inconsistent
-
-import argparse
-import os
-import random
-from collections import deque
-
 import numpy as np
+import pygame
 from pytorch_mlp import MLPRegression
+import argparse
 from console import FlappyBirdEnv
+
+
+# ── constants ──────────────────────────────────────────────────────────────────
+INPUT_DIM  = 8          # features fed to the network (see BUILD_STATE)
+OUTPUT_DIM = 2          # Q-values for [jump, do_nothing]
+LR         = 1e-3       # Adam learning rate
+HIDDEN     = (256, 512, 256)  # bigger net than default for lv5 complexity
+
+SCREEN_W   = 400        # from config.yml — used for normalisation
+SCREEN_H   = 600        # from config.yml — used for normalisation
+MAX_VEL    = 15.0       # rough max |velocity| for normalisation
 
 
 class MyAgent:
     def __init__(self, show_screen=False, load_model_path=None, mode=None):
+        # ── do not modify these ───────────────────────────────────────────────
         self.show_screen = show_screen
-        self.mode = mode if mode is not None else "train"
+        if mode is None:
+            self.mode = 'train'
+        else:
+            self.mode = mode
 
-        self.input_dim = 9
-        self.output_dim = 2
-        self.gamma = 0.95
-        self.learning_rate = 1e-4
-        self.batch_size = 128
-        self.memory = deque(maxlen=30000)
-        self.train_every = 2
-        self.target_update_every = 800
+        # ── storage D: list of transitions ───────────────────────────────────
+        # Each entry is a dict:
+        #   phi_t   : np.ndarray  — state features at time t
+        #   action  : int         — action taken at time t
+        #   reward  : float|None  — filled in by receive_after_action_observation
+        #   q_next  : float|None  — filled in by receive_after_action_observation
+        self.storage = []
 
-        self.epsilon = 0.35
-        self.epsilon_min = 0.03
-        self.epsilon_decay = 0.9997
-
-        self.q = MLPRegression(
-            input_dim=self.input_dim,
-            output_dim=self.output_dim,
-            hidden_dim=[128, 256, 128],
-            learning_rate=self.learning_rate,
+        # ── Q network (online, the one we train) ─────────────────────────────
+        self.network = MLPRegression(
+            input_dim=INPUT_DIM,
+            output_dim=OUTPUT_DIM,
+            hidden_dim=list(HIDDEN),
+            learning_rate=LR
         )
-        self.q_target = MLPRegression(
-            input_dim=self.input_dim,
-            output_dim=self.output_dim,
-            hidden_dim=[128, 256, 128],
-            learning_rate=self.learning_rate,
+        # ── Q_f network (fixed target, for stable TD targets) ─────────────────
+        self.network2 = MLPRegression(
+            input_dim=INPUT_DIM,
+            output_dim=OUTPUT_DIM,
+            hidden_dim=list(HIDDEN),
+            learning_rate=LR
         )
-        self.update_network_model(self.q_target, self.q)
+        # initialise Q_f's weights to match Q
+        MyAgent.update_network_model(net_to_update=self.network2,
+                                     net_as_source=self.network)
 
-        self.last_state_vec = None
-        self.last_raw_state = None
-        self.last_action_index = None
-        self.total_steps = 0
-        self.best_eval = -1
+        # ── hyper-parameters ─────────────────────────────────────────────────
+        self.epsilon         = 0.08   # ε — keep low; flappy bird is fragile
+        self.epsilon_min     = 0.01   # floor for epsilon decay
+        self.epsilon_decay   = 0.995  # multiply ε by this each episode
+        self.n               = 64     # minibatch size
+        self.discount_factor = 0.99   # γ
 
-        if load_model_path is not None and os.path.exists(load_model_path):
+        # ── do not modify this ────────────────────────────────────────────────
+        if load_model_path:
             self.load_model(load_model_path)
-            self.update_network_model(self.q_target, self.q)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # BUILD_STATE  — the most critical design decision
+    # ══════════════════════════════════════════════════════════════════════════
+    def build_state(self, state: dict) -> np.ndarray:
+        """
+        Converts the raw game state dict into a normalised feature vector φ.
+
+        Features (all normalised to roughly [-1, 1] or [0, 1]):
+          0  bird_y          / SCREEN_H
+          1  bird_velocity   / MAX_VEL
+          2  dx to next pipe / SCREEN_W          (how far away is the danger)
+          3  next pipe top   / SCREEN_H          (where is the gap top)
+          4  next pipe bottom/ SCREEN_H          (where is the gap bottom)
+          5  dx to 2nd pipe  / SCREEN_W
+          6  2nd pipe top    / SCREEN_H
+          7  2nd pipe bottom / SCREEN_H
+
+        Using TWO pipes ahead gives the agent enough lookahead for lv5 where
+        pipes come fast and the bird needs to plan its trajectory.
+        """
+        bird_y   = state['bird_y']   / SCREEN_H
+        bird_vel = state['bird_velocity'] / MAX_VEL
+
+        # ── find the pipes that are still ahead of the bird ──────────────────
+        bird_right = state['bird_x'] + state['bird_width']
+        # a pipe is "ahead" when its right edge hasn't fully passed the bird
+        ahead = [p for p in state['pipes']
+                 if p['x'] + p['width'] > state['bird_x']]
+        # sort by x so the closest pipe is first
+        ahead.sort(key=lambda p: p['x'])
+
+        def pipe_features(pipe):
+            dx  = (pipe['x'] - bird_right) / SCREEN_W
+            top = pipe['top']    / SCREEN_H
+            bot = pipe['bottom'] / SCREEN_H
+            return dx, top, bot
+
+        if len(ahead) >= 2:
+            dx1, top1, bot1 = pipe_features(ahead[0])
+            dx2, top2, bot2 = pipe_features(ahead[1])
+        elif len(ahead) == 1:
+            dx1, top1, bot1 = pipe_features(ahead[0])
+            dx2, top2, bot2 = 1.0, 0.5, 0.75   # dummy — no second pipe yet
+        else:
+            # no pipes on screen at all (happens briefly at episode start)
+            dx1, top1, bot1 = 1.0, 0.5, 0.75
+            dx2, top2, bot2 = 1.0, 0.5, 0.75
+
+        phi = np.array([bird_y, bird_vel,
+                        dx1, top1, bot1,
+                        dx2, top2, bot2], dtype=np.float32)
+        return phi
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # REWARD  — shaped to encourage survival and penalise bad deaths differently
+    # ══════════════════════════════════════════════════════════════════════════
     @staticmethod
-    def update_network_model(net_to_update, net_as_source):
-        net_to_update.load_state_dict(net_as_source.state_dict())
+    def reward(state_after: dict) -> float:
+        """
+        r_t based on s_{t+1}:
+          • Alive each step          → +1      (encourages survival)
+          • hit_pipe                 → -100    (worst: bird had no height awareness)
+          • off_screen (top/bottom)  → -50     (bad but shows some awareness)
+          • well_done                → +200    (completed the episode perfectly)
+        """
+        done_type = state_after['done_type']
+        if done_type == 'hit_pipe':
+            return -100.0
+        elif done_type == 'offscreen':
+            return -50.0
+        elif done_type == 'well_done':
+            return 200.0
+        else:
+            return 1.0   # 'not_done' — survived this step
 
-    def save_model(self, path="my_model.ckpt"):
-        self.q.save_model(path)
-
-    def load_model(self, path="my_model.ckpt"):
-        self.q.load_model(path)
-
-    def _index_to_action(self, index, action_table):
-        return action_table["jump"] if index == 0 else action_table["do_nothing"]
-
-    def one_hot(self, index):
-        w = np.zeros(self.output_dim, dtype=np.float32)
-        w[index] = 1.0
+    # ══════════════════════════════════════════════════════════════════════════
+    # ONEHOT  — mask which output node to train towards
+    # ══════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def onehot(action: int, num_actions: int = OUTPUT_DIM) -> np.ndarray:
+        """
+        Returns a binary weight vector w_j of shape (num_actions,).
+        Only the index corresponding to action a_j is 1; the rest are 0.
+        This tells fit_step to only update the Q-value for the action taken,
+        leaving the other output node's gradient as zero.
+        """
+        w = np.zeros(num_actions, dtype=np.float32)
+        w[action] = 1.0
         return w
 
-    def _next_pipe_info(self, state):
-        bx = float(state["bird_x"])
-        bw = float(state["bird_width"])
-        screen_w = float(state["screen_width"])
-        screen_h = float(state["screen_height"])
-        attrs = state.get("pipe_attributes", {})
-        pipe_w_default = float(attrs.get("width", 60))
-        gap = float(attrs.get("gap", screen_h))
-        mean_top = float(attrs.get("window_y_mean", 250))
+    # ══════════════════════════════════════════════════════════════════════════
+    # CHOOSE_ACTION  — ε-greedy during train, greedy during eval
+    # ══════════════════════════════════════════════════════════════════════════
+    def choose_action(self, state: dict, action_table: dict) -> int:
+        """
+        Algorithm 2 — CHOOSE_ACTION pseudocode:
+          phi_t = BUILD_STATE(s_t)
+          if train:
+              with prob ε  → random action
+              else         → argmax_a Q(phi_t, a)
+              store partial transition (phi_t, a_t, None, None) in D
+          elif eval:
+              a_t = argmax_a Q(phi_t, a)
+          return a_t
+        """
+        phi_t = self.build_state(state)
 
-        pipes = state.get("pipes", [])
-        candidates = [p for p in pipes if float(p["x"]) + float(p.get("width", pipe_w_default)) >= bx]
-
-        if candidates:
-            p = min(candidates, key=lambda pp: float(pp["x"]))
-            px = float(p["x"])
-            pw = float(p.get("width", pipe_w_default))
-            top = float(p["top"])
-            bottom = float(p["bottom"])
-        else:
-            px = screen_w + pipe_w_default
-            pw = pipe_w_default
-            if gap >= screen_h:
-                top, bottom = 0.0, screen_h
+        if self.mode == 'train':
+            if np.random.rand() < self.epsilon:
+                # explore: random between jump(0) and do_nothing(1) only
+                a_t = np.random.choice([action_table['jump'],
+                                        action_table['do_nothing']])
             else:
-                top, bottom = mean_top, mean_top + gap
+                # exploit: pick action with highest Q-value
+                q_vals = self.network.predict(phi_t.reshape(1, -1))[0]
+                a_t = int(np.argmax(q_vals))
 
-        center = (top + bottom) / 2.0
-        dx_front = px - (bx + bw)
-        return px, pw, top, bottom, center, dx_front
+            # store partial transition — reward and q_next filled in later
+            self.storage.append({
+                'phi_t':   phi_t,
+                'action':  a_t,
+                'reward':  None,
+                'q_next':  None,
+            })
 
-    def build_state(self, state):
-        screen_w = float(state["screen_width"])
-        screen_h = float(state["screen_height"])
-        by = float(state["bird_y"])
-        bh = float(state["bird_height"])
-        cy = by + bh / 2.0
-        v = float(state["bird_velocity"])
-        px, pw, top, bottom, center, dx = self._next_pipe_info(state)
+        else:  # eval mode — pure greedy, no exploration, no storage
+            q_vals = self.network.predict(phi_t.reshape(1, -1))[0]
+            a_t = int(np.argmax(q_vals))
 
-        features = np.array([
-            cy / screen_h,
-            v / 10.0,
-            dx / screen_w,
-            (px + pw - float(state["bird_x"])) / screen_w,
-            center / screen_h,
-            (cy - center) / screen_h,
-            top / screen_h,
-            bottom / screen_h,
-            (bottom - top) / screen_h,
-        ], dtype=np.float32)
-        return np.clip(features, -2.0, 2.0)
+        return a_t
 
-    def heuristic_action_index(self, state):
-        screen_h = float(state["screen_height"])
-        by = float(state["bird_y"])
-        bh = float(state["bird_height"])
-        cy = by + bh / 2.0
-        v = float(state["bird_velocity"])
-        _, _, top, bottom, center, dx = self._next_pipe_info(state)
+    # ══════════════════════════════════════════════════════════════════════════
+    # RECEIVE_AFTER_ACTION_OBSERVATION  — core DQN update step
+    # ══════════════════════════════════════════════════════════════════════════
+    def receive_after_action_observation(self, state: dict,
+                                         action_table: dict) -> None:
+        """
+        Algorithm 2 — RECEIVE_AFTER_ACTION_OBSERVATION pseudocode:
+          phi_{t+1} = BUILD_STATE(s_{t+1})
+          r_t       = REWARD(s_{t+1})
+          if terminal: q_{t+1} = 0
+          else:         q_{t+1} = max_a Q_f(phi_{t+1}, a)
+          update last transition in D with (r_t, q_{t+1})
 
-        attrs = state.get("pipe_attributes", {})
-        gap = float(attrs.get("gap", bottom - top))
-        formation = attrs.get("formation", "random")
-        pipe_width = float(attrs.get("width", 60))
-
-        if formation == "sine":
-            target = center + 60.0
-            velocity_gain = 4.0
-        elif gap <= 160:
-            target = center + 50.0
-            velocity_gain = 4.0
-        elif pipe_width >= 70:
-            target = center + 60.0
-            velocity_gain = 3.0
-        else:
-            target = center + 40.0
-            velocity_gain = 3.0
-
-        if not state.get("pipes"):
-            target = screen_h * 0.48
-            velocity_gain = 3.0
-
-        if by < 45:
-            return 1
-        if by + bh > screen_h - 80:
-            return 0
-
-        predicted_y = cy + velocity_gain * v
-        return 0 if predicted_y > target else 1
-
-    def reward(self, prev, curr):
-        if prev is None:
-            return 0.0
-
-        if curr.get("done", False):
-            if curr.get("done_type") == "well_done":
-                return 120.0
-            if curr.get("done_type") == "hit_pipe":
-                return -80.0
-            return -100.0
-
-        r = 0.2
-        score_delta = curr.get("score", 0) - prev.get("score", 0)
-        if score_delta > 0:
-            r += 40.0 * score_delta
-
-        screen_h = float(curr["screen_height"])
-        by = float(curr["bird_y"])
-        bh = float(curr["bird_height"])
-        cy = by + bh / 2.0
-        _, _, top, bottom, center, dx = self._next_pipe_info(curr)
-        error = abs(cy - (center + 40.0)) / screen_h
-        r += max(0.0, 1.0 - 4.0 * error)
-
-        r += 0.005 * (curr.get("mileage", 0) - prev.get("mileage", 0))
-        return float(r)
-
-    def _train_from_memory(self):
-        if len(self.memory) < self.batch_size:
-            return
-        batch = random.sample(self.memory, self.batch_size)
-        X = np.vstack([b[0] for b in batch]).astype(np.float32)
-        Y = np.vstack([b[2] for b in batch]).astype(np.float32)
-        W = np.vstack([b[3] for b in batch]).astype(np.float32)
-        self.q.fit_step(X, Y, W)
-
-    def choose_action(self, state, action_table):
-        state_vec = self.build_state(state)
-
-        if self.mode == "eval":
-            action_index = self.heuristic_action_index(state)
-        else:
-            roll = random.random()
-            if roll < self.epsilon:
-                action_index = random.randint(0, 1)
-            elif roll < self.epsilon + 0.65:
-                action_index = self.heuristic_action_index(state)
-            else:
-                q_values = self.q.predict(state_vec.reshape(1, -1))[0]
-                action_index = int(np.argmax(q_values))
-
-        self.last_state_vec = state_vec
-        self.last_raw_state = state
-        self.last_action_index = action_index
-        return self._index_to_action(action_index, action_table)
-
-    def receive_after_action_observation(self, state, action_table):
-        if self.mode == "eval":
-            return
-        if self.last_state_vec is None or self.last_raw_state is None or self.last_action_index is None:
+          sample minibatch from D
+          for each (phi_j, a_j, r_j, q_{j+1}):
+              w_j = ONEHOT(a_j)
+              y_j = r_j + γ * q_{j+1}
+              add to X, Y, W
+          fit Q on (X, Y, W)
+          [optionally decay ε]
+        """
+        if self.mode != 'train':
             return
 
-        self.total_steps += 1
-        next_vec = self.build_state(state)
-        r = self.reward(self.last_raw_state, state)
+        # ── nothing stored yet (edge case) ───────────────────────────────────
+        if len(self.storage) == 0:
+            return
 
-        old_q = self.q.predict(self.last_state_vec.reshape(1, -1))[0]
-        target = old_q.copy()
+        phi_next = self.build_state(state)
 
-        if state.get("done", False):
-            target[self.last_action_index] = r
+        # ── compute r_t ──────────────────────────────────────────────────────
+        r_t = self.reward(state)
+
+        # ── compute q_{t+1} using fixed target network Q_f ───────────────────
+        is_terminal = state['done']
+        if is_terminal:
+            q_next = 0.0
         else:
-            future_q = self.q_target.predict(next_vec.reshape(1, -1))[0]
-            target[self.last_action_index] = r + self.gamma * float(np.max(future_q))
+            q_vals_next = self.network2.predict(phi_next.reshape(1, -1))[0]
+            q_next = float(np.max(q_vals_next))
 
-        teacher_idx = self.heuristic_action_index(self.last_raw_state)
-        teacher_target = old_q.copy()
-        teacher_target[teacher_idx] = max(teacher_target[teacher_idx], 10.0)
+        # ── update the last (partial) transition in D ─────────────────────────
+        self.storage[-1]['reward'] = r_t
+        self.storage[-1]['q_next'] = q_next
 
-        self.memory.append((self.last_state_vec, target, target, self.one_hot(self.last_action_index)))
-        self.memory.append((self.last_state_vec, teacher_target, teacher_target, self.one_hot(teacher_idx)))
+        # ── only train once we have enough complete transitions ───────────────
+        complete = [t for t in self.storage
+                    if t['reward'] is not None and t['q_next'] is not None]
+        if len(complete) < self.n:
+            return
 
-        if self.total_steps % self.train_every == 0:
-            self._train_from_memory()
+        # ── sample a random minibatch ─────────────────────────────────────────
+        indices   = np.random.choice(len(complete), size=self.n, replace=False)
+        minibatch = [complete[i] for i in indices]
 
-        if self.total_steps % self.target_update_every == 0:
-            self.update_network_model(self.q_target, self.q)
+        X = np.zeros((self.n, INPUT_DIM),  dtype=np.float32)
+        Y = np.zeros((self.n, OUTPUT_DIM), dtype=np.float32)
+        W = np.zeros((self.n, OUTPUT_DIM), dtype=np.float32)
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        for j, transition in enumerate(minibatch):
+            phi_j   = transition['phi_t']
+            a_j     = transition['action']
+            r_j     = transition['reward']
+            q_jp1   = transition['q_next']
 
-    def after_action_observation(self, state, action_table):
-        return self.receive_after_action_observation(state, action_table)
+            w_j = self.onehot(a_j)
+            y_j = r_j + self.discount_factor * q_jp1
 
+            # current Q predictions — we only update the taken action's output
+            q_current = self.network.predict(phi_j.reshape(1, -1))[0]
 
-def evaluate(level, model_path="my_model.ckpt", episodes=10, game_length=None):
-    env = FlappyBirdEnv(config_file_path="config.yml", show_screen=False, level=level, game_length=game_length)
-    agent = MyAgent(show_screen=False, load_model_path=model_path, mode="eval")
+            X[j] = phi_j
+            Y[j] = q_current          # start from current predictions …
+            Y[j, a_j] = y_j           # … then overwrite with the TD target
+            W[j] = w_j                # mask: only train the taken action
 
-    scores, mileages = [], []
-    for _ in range(episodes):
-        env.play(player=agent)
-        scores.append(env.score)
-        mileages.append(env.mileage)
+        # ── one gradient step on Q ────────────────────────────────────────────
+        self.network.fit_step(X, Y, W)
 
-    return scores, mileages
+    # ══════════════════════════════════════════════════════════════════════════
+    # DECAY EPSILON  — call once per episode from the training loop
+    # ══════════════════════════════════════════════════════════════════════════
+    def decay_epsilon(self):
+        self.epsilon = max(self.epsilon_min,
+                           self.epsilon * self.epsilon_decay)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # MODEL SAVE / LOAD / SYNC  (do not modify save/load)
+    # ══════════════════════════════════════════════════════════════════════════
+    def save_model(self, path: str = 'my_model.ckpt'):
+        self.network.save_model(path=path)
 
-def train(args):
-    env = FlappyBirdEnv(config_file_path="config.yml", show_screen=False, level=args.level)
-    agent = MyAgent(show_screen=False, mode="train")
+    def load_model(self, path: str = 'my_model.ckpt'):
+        self.network.load_model(path=path)
 
-    agent.save_model(args.model_path)
-
-    best_key = (-1, -1.0)
-    for ep in range(1, args.episodes + 1):
-        env.play(player=agent)
-
-        if ep % args.eval_every == 0 or ep == 1:
-            agent.save_model(args.model_path)
-            scores, miles = evaluate(
-                args.level,
-                args.model_path,
-                args.eval_episodes,
-                game_length=50 if args.level == 5 else None,
-            )
-
-            max_score = max(scores)
-            mean_score = float(np.mean(scores))
-            mean_mileage = float(np.mean(miles))
-
-            print(
-                f"Episode {ep:05d} | train_score={env.score:02d} mileage={env.mileage:05d} | "
-                f"eval_max={max_score:.1f} eval_mean={mean_score:.2f} "
-                f"eval_mileage={mean_mileage:.1f} | epsilon={agent.epsilon:.3f} memory={len(agent.memory)}"
-            )
-
-            key = (max_score, mean_score)
-            if key >= best_key:
-                best_key = key
-                agent.save_model(args.model_path)
-                print(f"  saved best model to {args.model_path}")
+    @staticmethod
+    def update_network_model(net_to_update: MLPRegression,
+                             net_as_source: MLPRegression):
+        net_to_update.load_state_dict(net_as_source.state_dict())
 
 
-def main():
+# ══════════════════════════════════════════════════════════════════════════════
+# TRAINING LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == '__main__':
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--level", type=int, default=5)
-    parser.add_argument("--episodes", type=int, default=1000)
-    parser.add_argument("--eval_episodes", type=int, default=10)
-    parser.add_argument("--eval_every", type=int, default=100)
-    parser.add_argument("--model_path", type=str, default="my_model.ckpt")
-    parser.add_argument("--eval_only", action="store_true")
+    parser.add_argument('--level', type=int, default=5)
     args = parser.parse_args()
 
-    if args.eval_only:
-        scores, miles = evaluate(
-            args.level,
-            args.model_path,
-            args.eval_episodes,
-            game_length=50 if args.level == 5 else None,
-        )
-        print("scores:", scores)
-        print("max:", max(scores), "mean:", float(np.mean(scores)), "mean_mileage:", float(np.mean(miles)))
-    else:
-        train(args)
+    # ── training environment ─────────────────────────────────────────────────
+    env   = FlappyBirdEnv(config_file_path='config.yml',
+                          show_screen=False,       # False = faster training
+                          level=args.level,
+                          game_length=10)
+    agent = MyAgent(show_screen=False)
 
+    EPISODES           = 10000
+    CLEAR_MEMORY_EVERY = 5     # clear D every N episodes (keeps Q targets fresh)
+    UPDATE_QF_EVERY    = 5     # sync Q_f ← Q every N episodes
 
-if __name__ == "__main__":
-    main()
+    best_avg_score  = -1.0
+    recent_scores   = []
+
+    for episode in range(1, EPISODES + 1):
+        env.play(player=agent)
+
+        score   = env.score
+        mileage = env.mileage
+        recent_scores.append(score)
+        if len(recent_scores) > 20:
+            recent_scores.pop(0)
+
+        avg_score = np.mean(recent_scores)
+
+        # ── save best model ──────────────────────────────────────────────────
+        if avg_score > best_avg_score:
+            best_avg_score = avg_score
+            agent.save_model(path='my_model.ckpt')
+
+        # ── periodic logging ─────────────────────────────────────────────────
+        if episode % 100 == 0:
+            print(f"Ep {episode:>5} | score={score} | "
+                  f"avg20={avg_score:.2f} | best_avg={best_avg_score:.2f} | "
+                  f"ε={agent.epsilon:.4f} | D={len(agent.storage)}")
+
+        # ── clear replay memory ──────────────────────────────────────────────
+        if episode % CLEAR_MEMORY_EVERY == 0:
+            agent.storage = []
+
+        # ── sync Q_f ← Q ─────────────────────────────────────────────────────
+        if episode % UPDATE_QF_EVERY == 0:
+            MyAgent.update_network_model(net_to_update=agent.network2,
+                                         net_as_source=agent.network)
+
+        # ── decay epsilon ─────────────────────────────────────────────────────
+        agent.decay_epsilon()
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # EVALUATION  (mirrors Gradescope evaluation)
+    # ══════════════════════════════════════════════════════════════════════════
+    print("\n--- Evaluation ---")
+    env2   = FlappyBirdEnv(config_file_path='config.yml',
+                           show_screen=False, level=args.level)
+    agent2 = MyAgent(show_screen=False,
+                     load_model_path='my_model.ckpt',
+                     mode='eval')
+
+    scores = []
+    for episode in range(10):
+        env2.play(player=agent2)
+        scores.append(env2.score)
+
+    print(f"Max score:  {np.max(scores)}")
+    print(f"Mean score: {np.mean(scores):.2f}")
